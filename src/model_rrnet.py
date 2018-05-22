@@ -2,8 +2,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Variable
+import math
+from torch.nn import Parameter
+from torch.nn import init
 from LSTMCell import LSTMCell
+
+
+class NoisyLinear(nn.Linear):
+    def __init__(self, in_features, out_features, sigma_init=0.017, bias=True):
+        super(NoisyLinear, self).__init__(in_features, out_features, bias=True)  # TODO: Adapt for no bias
+        # µ^w and µ^b reuse self.weight and self.bias
+        self.sigma_init = sigma_init
+        self.sigma_weight = Parameter(torch.Tensor(out_features, in_features))  # σ^w
+        self.sigma_bias = Parameter(torch.Tensor(out_features))  # σ^b
+        self.register_buffer('epsilon_weight', torch.zeros(out_features, in_features))
+        self.register_buffer('epsilon_bias', torch.zeros(out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if hasattr(self, 'sigma_weight'):  # Only init after all params added (otherwise super().__init__() fails)
+            init.uniform_(self.weight, -math.sqrt(3 / self.in_features), math.sqrt(3 / self.in_features))
+            init.uniform_(self.bias, -math.sqrt(3 / self.in_features), math.sqrt(3 / self.in_features))
+            init.constant_(self.sigma_weight, self.sigma_init)
+            init.constant_(self.sigma_bias, self.sigma_init)
+
+    def forward(self, input):
+        return F.linear(input, self.weight + self.sigma_weight * self.epsilon_weight,
+                        self.bias + self.sigma_bias * self.epsilon_bias)
+
+    def sample_noise(self):
+        self.epsilon_weight.normal_()
+        self.epsilon_bias.normal_()
+
+    def remove_noise(self):
+        self.epsilon_weight.zero_()
+        self.epsilon_bias.zero_()
 
 
 class RRNetModel(nn.Module):
@@ -24,16 +57,14 @@ class RRNetModel(nn.Module):
         self.mcell = LSTMCell(ninp + nhid, nhid)
         # actor cell
         self.pi = nn.Sequential(nn.Linear(nhid + ninp, ninp),
-                                nn.BatchNorm1d(ninp),
+                                nn.LayerNorm(ninp),
                                 nn.ReLU(),
                                 nn.Linear(ninp, 3))
         # encoder/decoder
         self.encoder = nn.Embedding(ntoken, ninp)
         self.decoder = nn.Linear(ninp, ntoken)
-
         if tie_weights:
             self.decoder.weight = self.encoder.weight
-
         self.predictor = nn.Sequential(nn.Linear(nhid, ninp),
                                        nn.BatchNorm1d(ninp),
                                        nn.Tanh())
@@ -43,6 +74,26 @@ class RRNetModel(nn.Module):
         self.nlayers = nlayers
         self._vars = {}
         self._sent = torch.zeros(self.nhid).cuda()
+
+    def sample_noise(self):
+        def _helper(mod):
+            for module in mod._modules.values():
+                if isinstance(module, NoisyLinear):
+                    module.sample_noise()
+                else:
+                    if len(module._modules):
+                        _helper(module)
+        _helper(self)
+
+    def remove_noise(self):
+        def _helper(mod):
+            for module in mod._modules.values():
+                if isinstance(module, NoisyLinear):
+                    module.remove_noise()
+                else:
+                    if len(module._modules):
+                        _helper(module)
+        _helper(self)
 
     def init_weights(self):
         initrange = 0.01
@@ -77,14 +128,20 @@ class RRNetModel(nn.Module):
         # assume it's on GPU
         return torch.cuda.ByteTensor(mask)
 
-    def forward(self, input, hidden_states, stack=None, mode="sample"):
+    def forward(self, input, hidden_states, stack=None, mode="sample", eps=0.):
+        if self.training:
+            self.sample_noise()
+        else:
+            self.remove_noise()
+
         T, B = input.size()
         if not stack:
             stack = self.init_stack(B)
         emb = self.drop(self.encoder(input))
         hx, cx = hidden_states
 
-        rmask = torch.ones(self.nlayers, self.nhid)
+        # TODO: use this
+        rmask = torch.ones(self.nhid)
         if input.is_cuda:
             rmask = rmask.cuda()
         rmask = self.rdrop(rmask)
@@ -99,21 +156,34 @@ class RRNetModel(nn.Module):
         for i in range(input.size(0)):
             hi = emb[i]  # emb_i: bsz, nhid
             htm1, ctm1 = last_states
+
             # actions
-            pi_cur = self.pi(torch.cat([htm1, hi], 1))
             mask = self._get_mask(stack, only_recur=(mode == "only_recur"))
+            pi_cur = self.pi(torch.cat([htm1, hi], 1).detach())
             pi_cur.data.masked_fill_(mask, -float('inf'))
             pi_cur = F.softmax(pi_cur, 1)
+
+            pi_rnd = pi_cur * 0.
+            pi_rnd.data.masked_fill_(mask, -float('inf'))
+            pi_rnd = F.softmax(pi_rnd, 1)
+
+            # sampling
             pi_cur_cat = torch.distributions.Categorical(pi_cur)
-            actions_cur = pi_cur_cat.sample()
+            pi_smp_cat = pi_cur_cat
+            if eps > 0.:
+                pi_smp_cat = torch.distributions.Categorical(
+                    (1. - eps) * pi_cur + eps * pi_rnd)
+            actions_cur = pi_smp_cat.sample()
             actions_cur_logp = pi_cur_cat.log_prob(actions_cur)
             actions = actions_cur.squeeze().detach().data.cpu().numpy()
+
             # processes
-            hr, cr = self.rcell(hi, (htm1, ctm1))
-            hs, cs = self.scell(hi, (htm1, ctm1))
+            hr, cr = self.rcell(hi, (htm1 * rmask, ctm1))
+            hs, cs = self.scell(hi, (htm1 * rmask, ctm1))
             si = self.emulate_stack_pop(stack)
-            hm, cm = self.mcell(torch.cat([hi, si], -1), (htm1, ctm1))
+            hm, cm = self.mcell(torch.cat([hi, si], -1), (htm1 * rmask, ctm1))
             new_states = []
+
             # update hidden states and stack
             for b in range(B):
                 # split

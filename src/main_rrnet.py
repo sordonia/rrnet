@@ -30,6 +30,8 @@ parser.add_argument('--lr', type=float, default=0.003,
                     help='initial learning rate')
 parser.add_argument('--weight_decay', type=float, default=6.485508340193558e-06,
                     help='weight decay')
+parser.add_argument('--weight_entropy', type=float, default=0.02,
+                    help='entropy reward')
 parser.add_argument('--clip', type=float, default=1.,
                     help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=150,
@@ -151,6 +153,7 @@ def evaluate(data_source):
     ntokens = len(corpus.dictionary)
     stack = None
     hidden = model.init_hidden(eval_batch_size)
+
     for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, evaluation=True)
         output, hidden = model(data, hidden, stack=stack)
@@ -158,14 +161,21 @@ def evaluate(data_source):
         output_flat = output.view(-1, ntokens)
         total_loss += len(data) * criterion(output_flat, targets).item()
         hidden = repackage_hidden(hidden)
+
     return total_loss / len(data_source)
 
-nupdates = 0
 
-def train():
+nupdates = 0
+eps_schedule = np.linspace(0., 1.0, num=10)[::-1]
+
+
+def train(epoch):
     # Turn on training mode which enables dropout.
     model.train()
-    global nupdates
+    global nupdates, eps_schedule
+    eps = eps_schedule[epoch] if epoch < len(eps_schedule) else 0.
+    print("Training with eps: {:.3f}".format(eps))
+
     total_loss = 0
     start_time = time.time()
     ntokens = len(corpus.dictionary)
@@ -180,26 +190,21 @@ def train():
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
 
-        # only recurrent model
-        # outputs, hidden = model(data, hidden, mode="argmax")
-        # only_recur_rewards = model.compute_rewards(outputs, targets)
-
-        # do the sampling here
-        outputs, hidden = model(data, hidden, stack=stack)
+        outputs, hidden = model(data, hidden, stack=stack, eps=float(eps))
         logp_actions = model._vars['seq_logp_actions']
         entropy = model._vars['seq_entropy']
         stack = model._vars['stack']
 
         loss = model.compute_loss(outputs, targets)
         rewards = model.compute_rewards(outputs, targets)
-        adv_rewards = (rewards - rewards.mean())
+        adv_rewards = torch.clamp(rewards - rewards.mean(1).unsqueeze(1), -1, 1)
 
         rl_loss = 0.
         for logp_action, reward in zip(logp_actions, adv_rewards):
             rl_loss += torch.mean(-logp_action * reward)
         rl_loss /= data.size(0)
 
-        (loss + rl_loss - 0.05 * entropy.mean()).backward()
+        (loss + rl_loss - args.weight_entropy * entropy.mean()).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
 
@@ -228,13 +233,13 @@ lr = args.lr
 best_val_loss = None
 optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0, 0.999), eps=1e-9, weight_decay=args.weight_decay)
 scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, 'min', 0.1, patience=5, threshold=0, min_lr=0.00005)
-model_file = os.path.join(args.output_dir, get_model_name())
+model_file = None
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
-        train()
+        train(epoch)
         val_loss = evaluate(val_data)
         test_loss = evaluate(test_data)
         print('epoch {:d}, valid loss {:5.2f}, valid ppl {:8.2f}'.format(
@@ -244,7 +249,9 @@ try:
         writer.add_scalar('tst_ppl', math.exp(test_loss), epoch)
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
-            model_file = os.path.join(args.output_dir, "model.pt")
+            if model_file:
+                os.remove(model_file)
+            model_file = get_model_name(val_ppl, test_ppl)
             print('Saving %s' % model_file)
             with open(model_file, 'wb') as f:
                 torch.save(model, f)
