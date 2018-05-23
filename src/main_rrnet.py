@@ -167,14 +167,17 @@ def evaluate(data_source):
 
 nupdates = 0
 eps_schedule = np.linspace(0., 1.0, num=10)[::-1]
+ent_schedule = np.linspace(0.01, args.weight_entropy, num=10)[::-1]
 
 
 def train(epoch):
     # Turn on training mode which enables dropout.
     model.train()
-    global nupdates, eps_schedule
-    eps = eps_schedule[epoch] if epoch < len(eps_schedule) else 0.
-    print("Training with eps: {:.3f}".format(eps))
+    global nupdates, eps_schedule, ent_schedule
+    lam_eps = eps_schedule[epoch] if epoch < len(eps_schedule) else 0.
+    lam_ent = ent_schedule[epoch] if epoch < len(ent_schedule) else 0.
+    print("Training with lam_eps: {:.3f}".format(lam_eps))
+    print("Training with lam_ent: {:.3f}".format(lam_ent))
 
     total_loss = 0
     start_time = time.time()
@@ -190,21 +193,21 @@ def train(epoch):
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
 
-        outputs, hidden = model(data, hidden, stack=stack, eps=float(eps))
+        outputs, hidden = model(data, hidden, stack=stack, eps=0.)
         logp_actions = model._vars['seq_logp_actions']
         entropy = model._vars['seq_entropy']
         stack = model._vars['stack']
 
         loss = model.compute_loss(outputs, targets)
         rewards = model.compute_rewards(outputs, targets)
-        adv_rewards = torch.clamp(rewards - rewards.mean(1).unsqueeze(1), -1, 1)
+        adv_rewards = rewards
 
         rl_loss = 0.
         for logp_action, reward in zip(logp_actions, adv_rewards):
             rl_loss += torch.mean(-logp_action * reward)
         rl_loss /= data.size(0)
 
-        (loss + rl_loss - args.weight_entropy * entropy.mean()).backward()
+        (loss + rl_loss + float(lam_ent) / entropy.mean()).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
 

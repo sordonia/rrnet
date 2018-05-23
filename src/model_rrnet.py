@@ -9,7 +9,7 @@ from LSTMCell import LSTMCell
 
 
 class NoisyLinear(nn.Linear):
-    def __init__(self, in_features, out_features, sigma_init=0.017, bias=True):
+    def __init__(self, in_features, out_features, sigma_init=3., bias=True):
         super(NoisyLinear, self).__init__(in_features, out_features, bias=True)  # TODO: Adapt for no bias
         # µ^w and µ^b reuse self.weight and self.bias
         self.sigma_init = sigma_init
@@ -177,7 +177,7 @@ class RRNetModel(nn.Module):
             actions_cur_logp = pi_cur_cat.log_prob(actions_cur)
             actions = actions_cur.squeeze().detach().data.cpu().numpy()
 
-            # processes
+            # updates
             hr, cr = self.rcell(hi, (htm1 * rmask, ctm1))
             hs, cs = self.scell(hi, (htm1 * rmask, ctm1))
             si = self.emulate_stack_pop(stack)
@@ -226,11 +226,13 @@ class RRNetModel(nn.Module):
         loss = torch.gather(-outputs, 2, targets.unsqueeze(2)).squeeze()
         return loss.mean()
 
-    def compute_rewards(self, outputs, targets, disc_gamma=0.98):
+    def compute_rewards(self, outputs, targets, disc_gamma=0.95):
         R = 0.
         T, B = targets.size()
-        # reward is 1 if most probable word index is the target, 0 sinon
-        reward_matrix = (torch.max(outputs, 2)[1] == targets).float()
+        # reward is 1 if probability of the correct token is higher than 0.5
+        p = F.softmax(outputs, 2)
+        p = torch.gather(p, 2, targets.unsqueeze(2)).squeeze()
+        reward_matrix = (p > 0.5).float()
         # discounted reward matrix
         reward_matrix_disc = np.zeros((T, B))
         t, start = T - 1, T - 1
