@@ -9,9 +9,8 @@ from LSTMCell import LSTMCell
 
 
 class NoisyLinear(nn.Linear):
-    def __init__(self, in_features, out_features, sigma_init=3., bias=True):
+    def __init__(self, in_features, out_features, sigma_init=0.017, bias=True):
         super(NoisyLinear, self).__init__(in_features, out_features, bias=True)  # TODO: Adapt for no bias
-        # µ^w and µ^b reuse self.weight and self.bias
         self.sigma_init = sigma_init
         self.sigma_weight = Parameter(torch.Tensor(out_features, in_features))  # σ^w
         self.sigma_bias = Parameter(torch.Tensor(out_features))  # σ^b
@@ -51,14 +50,12 @@ class RRNetModel(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.internal_drop = nn.Dropout(idropout)
         self.rdrop = nn.Dropout(rdropout)
-        # rrnet cells
+        # recurrent cell, very simple implementation
         self.rcell = LSTMCell(ninp, nhid)
-        self.scell = LSTMCell(ninp, nhid)
-        self.mcell = LSTMCell(ninp + nhid, nhid)
         # actor cell
         self.pi = nn.Sequential(nn.Linear(nhid + ninp, ninp),
                                 nn.LayerNorm(ninp),
-                                nn.ReLU(),
+                                nn.Tanh(),
                                 nn.Linear(ninp, 3))
         # encoder/decoder
         self.encoder = nn.Embedding(ntoken, ninp)
@@ -128,7 +125,7 @@ class RRNetModel(nn.Module):
         # assume it's on GPU
         return torch.cuda.ByteTensor(mask)
 
-    def forward(self, input, hidden_states, stack=None, mode="sample", eps=0.):
+    def forward(self, input, hidden_states, stack=None, only_recur=False, eps=0.):
         if self.training:
             self.sample_noise()
         else:
@@ -140,7 +137,6 @@ class RRNetModel(nn.Module):
         emb = self.drop(self.encoder(input))
         hx, cx = hidden_states
 
-        # TODO: use this
         rmask = torch.ones(self.nhid)
         if input.is_cuda:
             rmask = rmask.cuda()
@@ -158,19 +154,18 @@ class RRNetModel(nn.Module):
             htm1, ctm1 = last_states
 
             # actions
-            mask = self._get_mask(stack, only_recur=(mode == "only_recur"))
+            mask = self._get_mask(stack, only_recur=only_recur)
             pi_cur = self.pi(torch.cat([htm1, hi], 1).detach())
             pi_cur.data.masked_fill_(mask, -float('inf'))
             pi_cur = F.softmax(pi_cur, 1)
-
-            pi_rnd = pi_cur * 0.
-            pi_rnd.data.masked_fill_(mask, -float('inf'))
-            pi_rnd = F.softmax(pi_rnd, 1)
 
             # sampling
             pi_cur_cat = torch.distributions.Categorical(pi_cur)
             pi_smp_cat = pi_cur_cat
             if eps > 0.:
+                pi_rnd = pi_cur * 0.
+                pi_rnd.data.masked_fill_(mask, -float('inf'))
+                pi_rnd = F.softmax(pi_rnd, 1)
                 pi_smp_cat = torch.distributions.Categorical(
                     (1. - eps) * pi_cur + eps * pi_rnd)
             actions_cur = pi_smp_cat.sample()
@@ -179,12 +174,16 @@ class RRNetModel(nn.Module):
 
             # updates
             hr, cr = self.rcell(hi, (htm1 * rmask, ctm1))
-            hs, cs = self.scell(hi, (htm1 * rmask, ctm1))
             si = self.emulate_stack_pop(stack)
-            hm, cm = self.mcell(torch.cat([hi, si], -1), (htm1 * rmask, ctm1))
-            new_states = []
+            # split is just the same, but the hr is saved in the stack
+            hs, cs = hr, cr
+            # merge is just a weighted average of the previous state
+            hm, cm = (0.5 * hr + 0.5 * si), cr
+            # hs, cs = self.scell(hi, (htm1 * rmask, ctm1))
+            # hm, cm = self.mcell(torch.cat([hi, si], -1), (htm1 * rmask, ctm1))
 
             # update hidden states and stack
+            new_states = []
             for b in range(B):
                 # split
                 assert len(stack[b]) <= self.max_stack_size
@@ -226,19 +225,20 @@ class RRNetModel(nn.Module):
         loss = torch.gather(-outputs, 2, targets.unsqueeze(2)).squeeze()
         return loss.mean()
 
-    def compute_rewards(self, outputs, targets, disc_gamma=0.95):
+    def compute_rewards(self, outputs, targets, gamma=0.5):
         R = 0.
         T, B = targets.size()
         # reward is 1 if probability of the correct token is higher than 0.5
         p = F.softmax(outputs, 2)
         p = torch.gather(p, 2, targets.unsqueeze(2)).squeeze()
         reward_matrix = (p > 0.5).float()
+
         # discounted reward matrix
         reward_matrix_disc = np.zeros((T, B))
         t, start = T - 1, T - 1
         while t >= 0:
             past_reward = (reward_matrix_disc[t + 1] if t != start else 0.)
-            reward_matrix_disc[t] = disc_gamma * past_reward + reward_matrix[t]
+            reward_matrix_disc[t] = gamma * past_reward + reward_matrix[t]
             t -= 1
         reward_matrix_disc = torch.from_numpy(reward_matrix_disc).float().cuda()
         return reward_matrix_disc
