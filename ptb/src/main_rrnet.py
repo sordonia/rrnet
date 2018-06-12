@@ -158,7 +158,7 @@ def evaluate(data_source):
 
     for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, evaluation=True)
-        output, hidden = model(data, hidden, stack=stack)
+        output, hidden = model(data, hidden, stack=stack, argmax=False)
         stack = model._vars['stack']
         output_flat = output.view(-1, ntokens)
         total_loss += len(data) * criterion(output_flat, targets).item()
@@ -169,19 +169,16 @@ def evaluate(data_source):
 
 nupdates = 0
 eps_schedule = np.linspace(0., args.weight_eps, num=10)[::-1]
-ent_schedule = np.linspace(0.01, args.weight_entropy, num=10)[::-1]
 
 
 def train(epoch):
     # Turn on training mode which enables dropout.
     model.train()
-    global nupdates, eps_schedule, ent_schedule
+    global nupdates, eps_schedule
 
     lam_eps = eps_schedule[epoch] if epoch < len(eps_schedule) else 0.
-    lam_ent = ent_schedule[epoch] if epoch < len(ent_schedule) else 0.
 
     print("Training with lam_eps: {:.3f}".format(lam_eps))
-    print("Training with lam_ent: {:.3f}".format(lam_ent))
 
     total_loss = 0
     start_time = time.time()
@@ -197,21 +194,20 @@ def train(epoch):
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
 
-        # std rewards
         outputs, hidden = model(data, hidden, stack=stack, eps=lam_eps)
         logp_actions = model._vars['seq_logp_actions']
         entropy = model._vars['seq_entropy']
         stack = model._vars['stack']
 
         loss = model.compute_loss(outputs, targets)
-        rewards = model.compute_rewards(outputs, targets, gamma=0.99)
+        rewards = model.compute_rewards(outputs, targets, gamma=0.95)
 
         rl_loss = 0.
         for logp_action, reward in zip(logp_actions, rewards):
             rl_loss += torch.mean(-logp_action * reward)
         rl_loss /= data.size(0)
 
-        (loss + rl_loss + float(lam_ent) / entropy.mean()).backward()
+        (loss + rl_loss + float(args.weight_entropy) / entropy.mean()).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
 
