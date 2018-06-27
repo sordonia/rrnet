@@ -8,58 +8,35 @@ from torch.nn import init
 from LSTMCell import LSTMCell
 
 
-class NoisyLinear(nn.Linear):
-    def __init__(self, in_features, out_features, sigma_init=0.017, bias=True):
-        super(NoisyLinear, self).__init__(in_features, out_features, bias=True)  # TODO: Adapt for no bias
-        self.sigma_init = sigma_init
-        self.sigma_weight = Parameter(torch.Tensor(out_features, in_features))  # σ^w
-        self.sigma_bias = Parameter(torch.Tensor(out_features))  # σ^b
-        self.register_buffer('epsilon_weight', torch.zeros(out_features, in_features))
-        self.register_buffer('epsilon_bias', torch.zeros(out_features))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if hasattr(self, 'sigma_weight'):  # Only init after all params added (otherwise super().__init__() fails)
-            init.uniform_(self.weight, -math.sqrt(3 / self.in_features), math.sqrt(3 / self.in_features))
-            init.uniform_(self.bias, -math.sqrt(3 / self.in_features), math.sqrt(3 / self.in_features))
-            init.constant_(self.sigma_weight, self.sigma_init)
-            init.constant_(self.sigma_bias, self.sigma_init)
-
-    def forward(self, input):
-        return F.linear(input, self.weight + self.sigma_weight * self.epsilon_weight,
-                        self.bias + self.sigma_bias * self.epsilon_bias)
-
-    def sample_noise(self):
-        self.epsilon_weight.normal_()
-        self.epsilon_bias.normal_()
-
-    def remove_noise(self):
-        self.epsilon_weight.zero_()
-        self.epsilon_bias.zero_()
-
-
 class RRNetModel(nn.Module):
-    """Container module with an encoder, a recurrent module, and a decoder."""
-
     def __init__(self, ntoken, ninp, nhid, nlayers,
                  dropout=0.65, idropout=0.4, rdropout=0.25,
-                 max_stack_size=2, tie_weights=False):
+                 max_stack_size=2, tie_weights=False, only_recur=False):
         super(RRNetModel, self).__init__()
         self.max_stack_size = max_stack_size
         # dropout
         self.drop = nn.Dropout(dropout)
         self.internal_drop = nn.Dropout(idropout)
         self.rdrop = nn.Dropout(rdropout)
-        # recurrent cell, very simple implementation
-        self.rcell = LSTMCell(ninp, nhid)
+        # standard lstm cells for lower layers
+        self.lstms = [LSTMCell(ninp if nlayer == 0 else nhid, nhid) for nlayer in range(nlayers - 1)]
+        self.lstms = nn.ModuleList(self.lstms)
+        # recurrent cell in the top layer, very simple implementation
+        nbelow = ninp if nlayers == 1 else nhid
+        self.rcell = LSTMCell(nbelow, nhid)
         # actor cell
-        self.pi = nn.Sequential(nn.Linear(nhid + ninp, ninp),
+        self.pi = nn.Sequential(nn.Linear(2 * nhid + nbelow, ninp),
                                 nn.LayerNorm(ninp),
                                 nn.Tanh(),
                                 nn.Linear(ninp, 3))
+        self.vf = nn.Sequential(nn.Linear(2 * nhid + nbelow, ninp),
+                                nn.LayerNorm(ninp),
+                                nn.Tanh(),
+                                nn.Linear(ninp, 1))
         # encoder/decoder
         self.encoder = nn.Embedding(ntoken, ninp)
         self.decoder = nn.Linear(ninp, ntoken)
+        self.backrnn = nn.LSTM(ninp, nhid)
         if tie_weights:
             self.decoder.weight = self.encoder.weight
         self.predictor = nn.Sequential(nn.Linear(nhid, ninp),
@@ -71,26 +48,6 @@ class RRNetModel(nn.Module):
         self.nlayers = nlayers
         self._vars = {}
         self._sent = torch.zeros(self.nhid).cuda()
-
-    def sample_noise(self):
-        def _helper(mod):
-            for module in mod._modules.values():
-                if isinstance(module, NoisyLinear):
-                    module.sample_noise()
-                else:
-                    if len(module._modules):
-                        _helper(module)
-        _helper(self)
-
-    def remove_noise(self):
-        def _helper(mod):
-            for module in mod._modules.values():
-                if isinstance(module, NoisyLinear):
-                    module.remove_noise()
-                else:
-                    if len(module._modules):
-                        _helper(module)
-        _helper(self)
 
     def init_weights(self):
         initrange = 0.01
@@ -125,19 +82,18 @@ class RRNetModel(nn.Module):
         # assume it's on GPU
         return torch.cuda.ByteTensor(mask)
 
-    def forward(self, input, hidden_states, stack=None, only_recur=False, eps=0.):
-        if self.training:
-            self.sample_noise()
-        else:
-            self.remove_noise()
+    def backward(self, input, stack=None):
+        outputs, _ = self.backrnn(input)
+        return outputs
 
+    def forward(self, input, hidden_states, stack=None, only_recur=False, eps=0., argmax=False):
         T, B = input.size()
         if not stack:
             stack = self.init_stack(B)
         emb = self.drop(self.encoder(input))
         hx, cx = hidden_states
 
-        rmask = torch.ones(self.nhid)
+        rmask = torch.ones(self.nlayers, self.nhid)
         if input.is_cuda:
             rmask = rmask.cuda()
         rmask = self.rdrop(rmask)
@@ -146,6 +102,7 @@ class RRNetModel(nn.Module):
 
         seq_outputs = []
         seq_entropy = []
+        seq_values = []
         seq_actions = []
         seq_logp_actions = []
 
@@ -153,41 +110,60 @@ class RRNetModel(nn.Module):
             hi = emb[i]  # emb_i: bsz, nhid
             htm1, ctm1 = last_states
 
+            # first evolve lstm
+            next_states = [[], []]
+            for l, lstm in enumerate(self.lstms):
+                ht_l, ct_l = lstm(hi, (htm1[l] * rmask[l], ctm1[l]))
+                next_states[0].append(ht_l)
+                next_states[1].append(ct_l)
+                hi = self.internal_drop(ht_l)
+
+            htm1, ctm1 = (last_states[0][-1], last_states[1][-1])
+
             # actions
             mask = self._get_mask(stack, only_recur=only_recur)
-            pi_cur = self.pi(torch.cat([htm1, hi], 1).detach())
+            si = self.emulate_stack_pop(stack)
+
+            state = torch.cat([htm1, si, hi], 1)
+            vi_cur = self.vf(state).squeeze()
+
+            pi_cur = self.pi(state)
             pi_cur.data.masked_fill_(mask, -float('inf'))
             pi_cur = F.softmax(pi_cur, 1)
+            pi_cur = (1. - mask.float()) * pi_cur
+            pi_cur = pi_cur / pi_cur.sum(1, keepdim=True)
 
-            # sampling
-            pi_cur_cat = torch.distributions.Categorical(pi_cur)
-            pi_smp_cat = pi_cur_cat
+            # epsilon greedy exploration ?
             if eps > 0.:
                 pi_rnd = pi_cur * 0.
                 pi_rnd.data.masked_fill_(mask, -float('inf'))
                 pi_rnd = F.softmax(pi_rnd, 1)
-                pi_smp_cat = torch.distributions.Categorical(
-                    (1. - eps) * pi_cur + eps * pi_rnd)
-            actions_cur = pi_smp_cat.sample()
-            actions_cur_logp = pi_cur_cat.log_prob(actions_cur)
+                pi_smp = (1. - eps) * pi_cur + eps * pi_rnd
+            else:
+                pi_smp = pi_cur
+
+            if argmax:
+                actions_cur = torch.max(pi_cur, 1)[1].unsqueeze(1)
+            else:
+                actions_cur = torch.multinomial(pi_smp, 1, replacement=True)
+            actions_cur_logp = torch.log(torch.gather(pi_cur, 1, actions_cur).squeeze() + 1e-8)
             actions = actions_cur.squeeze().detach().data.cpu().numpy()
 
             # updates
-            hr, cr = self.rcell(hi, (htm1 * rmask, ctm1))
-            si = self.emulate_stack_pop(stack)
+            hr, cr = self.rcell(hi, (htm1 * rmask[-1], ctm1))
             # split is just the same, but the hr is saved in the stack
             hs, cs = hr, cr
             # merge is just a weighted average of the previous state
             hm, cm = (0.5 * hr + 0.5 * si), cr
-            # hs, cs = self.scell(hi, (htm1 * rmask, ctm1))
-            # hm, cm = self.mcell(torch.cat([hi, si], -1), (htm1 * rmask, ctm1))
 
             # update hidden states and stack
             new_states = []
             for b in range(B):
                 # split
-                assert len(stack[b]) <= self.max_stack_size
                 if actions[b] == 0:
+                    if len(stack[b]) >= self.max_stack_size:
+                        import ipdb
+                        ipdb.set_trace()
                     new_states.append((hs[b], cs[b]))
                     stack[b].append(hs[b])
                 elif actions[b] == 1:
@@ -200,8 +176,12 @@ class RRNetModel(nn.Module):
 
             new_s = torch.stack([s[0] for s in new_states], 0)
             new_c = torch.stack([s[1] for s in new_states], 0)
-            last_states = (new_s, new_c)
+            next_states[0].append(new_s)
+            next_states[1].append(new_c)
+            last_states = (torch.stack(next_states[0], 0),
+                           torch.stack(next_states[1], 0))
 
+            seq_values.append(vi_cur)
             seq_actions.append(actions)
             seq_entropy.append((-pi_cur * torch.log(pi_cur + 1e-8)).sum(1))
             seq_logp_actions.append(actions_cur_logp)
@@ -210,7 +190,8 @@ class RRNetModel(nn.Module):
         self._vars = {
             'seq_entropy': torch.stack(seq_entropy, 0),
             'seq_actions': np.asarray(seq_actions),
-            'seq_logp_actions': seq_logp_actions,
+            'seq_values': torch.stack(seq_values, 0),
+            'seq_logp_actions': torch.stack(seq_logp_actions, 0),
             'stack': self._detach_stack(stack)
         }
 
@@ -218,16 +199,17 @@ class RRNetModel(nn.Module):
         seq_outputs = self.predictor(seq_outputs)
         seq_outputs = self.drop(seq_outputs)
         seq_decoded = self.decoder(seq_outputs)
-        return seq_decoded.view(T, B, -1), (new_s, new_c)
+        return seq_decoded.view(T, B, -1), last_states
 
     def compute_loss(self, outputs, targets):
         outputs = F.log_softmax(outputs, 2)
         loss = torch.gather(-outputs, 2, targets.unsqueeze(2)).squeeze()
         return loss.mean()
 
-    def compute_rewards(self, outputs, targets, gamma=0.5):
+    def compute_pg_loss(self, outputs, targets, gamma=1.2):
         R = 0.
         T, B = targets.size()
+
         # reward is 1 if probability of the correct token is higher than 0.5
         p = F.softmax(outputs, 2)
         p = torch.gather(p, 2, targets.unsqueeze(2)).squeeze()
@@ -236,14 +218,20 @@ class RRNetModel(nn.Module):
         # discounted reward matrix
         reward_matrix_disc = np.zeros((T, B))
         t, start = T - 1, T - 1
+
         while t >= 0:
             past_reward = (reward_matrix_disc[t + 1] if t != start else 0.)
             reward_matrix_disc[t] = gamma * past_reward + reward_matrix[t]
             t -= 1
+
         reward_matrix_disc = torch.from_numpy(reward_matrix_disc).float().cuda()
-        return reward_matrix_disc
+        # baseline the rewards
+        vf_loss = (self._vars['seq_values'] - reward_matrix_disc).pow(2.).mean()
+        reward_matrix_disc -= self._vars['seq_values'].detach()
+        rl_loss = torch.mean(-(self._vars['seq_logp_actions'] * reward_matrix_disc))
+        return rl_loss, vf_loss
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
-        return (weight.new(bsz, self.nhid).zero_(), \
-                weight.new(bsz, self.nhid).zero_())
+        return (weight.new(self.nlayers, bsz, self.nhid).zero_(), \
+                weight.new(self.nlayers, bsz, self.nhid).zero_())
