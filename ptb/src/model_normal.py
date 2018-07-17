@@ -10,13 +10,15 @@ class RNNModel(nn.Module):
 
     def __init__(self, ntoken, ninp, nhid, nlayers,
                  dropout=0.65, idropout=0.4, rdropout=0.25,
-                 tie_weights=False):
+                 tie_weights=False, skip=False):
         super(RNNModel, self).__init__()
         self.drop = nn.Dropout(dropout)
         self.internal_drop = nn.Dropout(idropout)
         self.rdrop = nn.Dropout(rdropout)
         self.encoder = nn.Embedding(ntoken, ninp)
-        self.rnn = nn.ModuleList([LSTMCell(ninp, nhid)] + [LSTMCell(nhid, nhid) for i in range(nlayers-1)])
+        self.rnn = nn.ModuleList(
+            [LSTMCell(ninp, nhid)] +
+            [LSTMCell(nhid, nhid) for i in range(nlayers-1)])
         self.decoder = nn.Linear(ninp, ntoken)
 
         if tie_weights:
@@ -71,5 +73,5 @@ class RNNModel(nn.Module):
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
-        return weight.new(self.nlayers, bsz, self.nhid).zero_(), \
-               weight.new(self.nlayers, bsz, self.nhid).zero_()
+        return Variable(weight.new(self.nlayers, bsz, self.nhid).zero_()), \
+               Variable(weight.new(self.nlayers, bsz, self.nhid).zero_())

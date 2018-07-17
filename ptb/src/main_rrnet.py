@@ -40,6 +40,8 @@ parser.add_argument('--epochs', type=int, default=150,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=64, metavar='N',
                     help='batch size')
+parser.add_argument('--max_stack_size', type=int, default=2, metavar='N',
+                    help='max stack size')
 parser.add_argument('--bptt', type=int, default=35,
                     help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.5,
@@ -58,15 +60,16 @@ parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default=None,
                     help='path to save the final model')
+parser.add_argument('--only_recur', action='store_true')
 parser.add_argument('--load', type=str,  default=None,
                     help='path to save the final model')
 parser.add_argument('--device', type=int, default=0,
                     help='select GPU')
+parser.add_argument('--output_dir', type=str,
+                    default=os.environ.get('PT_OUTPUT_DIR', 'model'))
 args = parser.parse_args()
 
 torch.cuda.set_device(args.device)
-
-args.output_dir = os.environ.get('PT_OUTPUT_DIR', 'model')
 writer = SummaryWriter(args.output_dir)
 
 # Set the random seed manually for reproducibility.
@@ -109,7 +112,7 @@ test_data = batchify(corpus.test, eval_batch_size)
 ntokens = len(corpus.dictionary)
 model = model_rrnet.RRNetModel(ntokens, args.emsize, args.nhid, args.nlayers,
                                args.dropout, args.idropout, args.rdropout,
-                               max_stack_size=2, tie_weights=args.tied)
+                               max_stack_size=args.max_stack_size, tie_weights=args.tied)
 
 
 if not (args.load is None):
@@ -158,7 +161,8 @@ def evaluate(data_source):
 
     for i in range(0, data_source.size(0) - 1, args.bptt):
         data, targets = get_batch(data_source, i, evaluation=True)
-        output, hidden = model(data, hidden, stack=stack, argmax=True)
+        output, hidden = model(data, hidden, stack=stack, argmax=True,
+                               only_recur=args.only_recur)
         stack = model._vars['stack']
         output_flat = output.view(-1, ntokens)
         total_loss += len(data) * criterion(output_flat, targets).item()
@@ -169,6 +173,12 @@ def evaluate(data_source):
 
 nupdates = 0
 eps_schedule = np.linspace(0., args.weight_eps, num=10)[::-1]
+
+
+def repeat_batch(data, n_rep):
+    T, B = data.size()
+    data_ = data.transpose(0, 1).repeat(1, n_rep).reshape(B * n_rep, T).transpose(0, 1)
+    return data_
 
 
 def train(epoch):
@@ -194,35 +204,30 @@ def train(epoch):
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
 
-        outputs, hidden = model(data, hidden, stack=stack, eps=lam_eps)
-        logp_actions = model._vars['seq_logp_actions']
+        outputs, hidden = model(data, hidden, stack=stack, eps=lam_eps,
+                                only_recur=args.only_recur)
         entropy = model._vars['seq_entropy']
         stack = model._vars['stack']
 
-        loss = model.compute_loss(outputs, targets)
-        rewards = model.compute_rewards(outputs, targets, gamma=0.95)
+        ll_loss = model.compute_loss(outputs, targets)
+        pg_loss, vf_loss = model.compute_pg_loss(outputs, targets, gamma=0.95)
 
-        rl_loss = 0.
-        for logp_action, reward in zip(logp_actions, rewards):
-            rl_loss += torch.mean(-logp_action * reward)
-        rl_loss /= data.size(0)
-
-        (loss + rl_loss + float(args.weight_entropy) / entropy.mean()).backward()
+        (ll_loss + pg_loss + 0.1 * vf_loss - float(args.weight_entropy) * entropy.mean()).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
 
         mean_entropy = entropy.mean().item()
-        mean_reward = rewards.mean().item()
-        total_loss += loss.item()
+        total_loss += ll_loss.item()
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             print('epoch {:d}, {:d}/{:d} batches, lr {:02.6f}, ms/batch {:5.2f}, '
-                  'loss {:.2f}, rew {:.2f}, etpy {:.2f}, ppl {:.2f}'.format(
+                  'loss {:.2f}, pg_loss {:.3f}, vf_loss {:.3f}, etpy {:.2f}, ppl {:.2f}'.format(
                       epoch, batch, len(train_data) // args.bptt, lr,
                       elapsed * 1000 / args.log_interval, cur_loss,
-                      mean_reward, mean_entropy, math.exp(cur_loss)))
+                      pg_loss.item(), vf_loss.item(),
+                      mean_entropy, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
 
@@ -253,7 +258,7 @@ try:
         if not best_val_loss or val_loss < best_val_loss:
             if model_file:
                 os.remove(model_file)
-            model_file = get_model_name(val_ppl, test_ppl)
+            model_file = os.path.join(args.output_dir, get_model_name(val_ppl, test_ppl))
             print('Saving %s' % model_file)
             with open(model_file, 'wb') as f:
                 torch.save(model, f)

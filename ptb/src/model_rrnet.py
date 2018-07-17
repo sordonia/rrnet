@@ -18,8 +18,10 @@ class RRNetModel(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.internal_drop = nn.Dropout(idropout)
         self.rdrop = nn.Dropout(rdropout)
+        self.encoder = nn.Embedding(ntoken, ninp)
         # standard lstm cells for lower layers
-        self.lstms = [LSTMCell(ninp if nlayer == 0 else nhid, nhid) for nlayer in range(nlayers - 1)]
+        self.lstms = [LSTMCell(ninp if nlayer == 0 else nhid, nhid)
+                      for nlayer in range(nlayers - 1)]
         self.lstms = nn.ModuleList(self.lstms)
         # recurrent cell in the top layer, very simple implementation
         nbelow = ninp if nlayers == 1 else nhid
@@ -34,11 +36,10 @@ class RRNetModel(nn.Module):
                                 nn.Tanh(),
                                 nn.Linear(ninp, 1))
         # encoder/decoder
-        self.encoder = nn.Embedding(ntoken, ninp)
         self.decoder = nn.Linear(ninp, ntoken)
-        self.backrnn = nn.LSTM(ninp, nhid)
         if tie_weights:
             self.decoder.weight = self.encoder.weight
+
         self.predictor = nn.Sequential(nn.Linear(nhid, ninp),
                                        nn.BatchNorm1d(ninp),
                                        nn.Tanh())
@@ -118,7 +119,7 @@ class RRNetModel(nn.Module):
                 next_states[1].append(ct_l)
                 hi = self.internal_drop(ht_l)
 
-            htm1, ctm1 = (last_states[0][-1], last_states[1][-1])
+            htm1, ctm1 = (htm1[-1], ctm1[-1])
 
             # actions
             mask = self._get_mask(stack, only_recur=only_recur)
@@ -160,10 +161,7 @@ class RRNetModel(nn.Module):
             new_states = []
             for b in range(B):
                 # split
-                if actions[b] == 0:
-                    if len(stack[b]) >= self.max_stack_size:
-                        import ipdb
-                        ipdb.set_trace()
+                if actions[b] == 0 and len(stack[b]) < self.max_stack_size:
                     new_states.append((hs[b], cs[b]))
                     stack[b].append(hs[b])
                 elif actions[b] == 1:
@@ -176,6 +174,7 @@ class RRNetModel(nn.Module):
 
             new_s = torch.stack([s[0] for s in new_states], 0)
             new_c = torch.stack([s[1] for s in new_states], 0)
+
             next_states[0].append(new_s)
             next_states[1].append(new_c)
             last_states = (torch.stack(next_states[0], 0),
@@ -185,7 +184,7 @@ class RRNetModel(nn.Module):
             seq_actions.append(actions)
             seq_entropy.append((-pi_cur * torch.log(pi_cur + 1e-8)).sum(1))
             seq_logp_actions.append(actions_cur_logp)
-            seq_outputs.append(new_s)
+            seq_outputs.append(self.internal_drop(new_s))
 
         self._vars = {
             'seq_entropy': torch.stack(seq_entropy, 0),

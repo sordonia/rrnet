@@ -12,11 +12,11 @@ from tensorboardX import SummaryWriter
 import os
 import data
 import model_normal
-import model_rrnet
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default=os.environ.get('PT_DATA_DIR', './data'),
                     help='location of the data corpus')
+parser.add_argument('--model_type', type=str, default="lstm")
 parser.add_argument('--emsize', type=int, default=300,
                     help='size of word embeddings')
 parser.add_argument('--nhid', type=int, default=1200,
@@ -42,9 +42,11 @@ parser.add_argument('--idropout', type=float, default=0.4,
 parser.add_argument('--rdropout', type=float, default=0.4,
                     help='dropout applied to recurrent states (0 = no dropout)')
 # memory hyperparams
+parser.add_argument('--mem_comps', type=int, default=10,
+                    help='number of components for attention')
 parser.add_argument('--mem_ntop', type=int, default=10,
                     help='number of top states')
-parser.add_argument('--mem_size', type=int, default=100,
+parser.add_argument('--mem_size', type=int, default=500,
                     help='number of past hidden states to consider')
 parser.add_argument('--mem_nsteps', type=int, default=2,
                     help='number of update steps')
@@ -111,9 +113,8 @@ test_data = batchify(corpus.test, eval_batch_size)
 
 ntokens = len(corpus.dictionary)
 model = model_normal.RNNModel(ntokens, args.emsize, args.nhid, args.nlayers,
-			      args.dropout, args.idropout, args.rdropout,
-			      args.tied)
-
+                              args.dropout, args.idropout, args.rdropout,
+                              args.tied)
 
 if not (args.load is None):
     with open(args.load, 'rb') as f:
@@ -176,17 +177,24 @@ def train():
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(args.batch_size)
     train_data = batchify(corpus.train, args.batch_size, random_start_idx=True)
-    
+
     for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
         data, targets = get_batch(train_data, i)
+
+        # Starting each batch, we detach the hidden state from how it was previously produced.
+        # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
         output, hidden = model(data, hidden)
+
         loss = criterion(output.view(-1, ntokens), targets)
         loss.backward()
+
         torch.nn.utils.clip_grad_norm(model.parameters(), args.clip)
         optimizer.step()
+
         total_loss += loss.item()
+
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
@@ -218,7 +226,12 @@ try:
         writer.add_scalar('tst_ppl', math.exp(test_loss), epoch)
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
-            model_file = os.path.join(args.output_dir, "model.pt")
+            try:
+                print('Removing %s' % model_file)
+                os.remove(model_file)
+            except:
+                pass
+            model_file = os.path.join(args.output_dir, get_model_name(val_ppl, test_ppl))
             print('Saving %s' % model_file)
             with open(model_file, 'wb') as f:
                 torch.save(model, f)

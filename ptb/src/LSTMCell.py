@@ -4,6 +4,7 @@ from torch.nn.modules.rnn import *
 
 
 class LayerNorm(nn.Module):
+
     def __init__(self, features, eps=1e-6):
         super(LayerNorm, self).__init__()
         self.gamma = nn.Parameter(torch.ones(features))
@@ -17,6 +18,7 @@ class LayerNorm(nn.Module):
 
 
 class LSTMCell(RNNCellBase):
+
     def __init__(self, input_size, hidden_size, bias=True, dropout=0):
         super(LSTMCell, self).__init__()
         self.input_size = input_size
@@ -28,14 +30,18 @@ class LSTMCell(RNNCellBase):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, input, hidden):
+
         hx, cx = hidden
         gates = self.ih(input) + self.hh(hx)
+
         ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
+
         ingate = F.sigmoid(ingate)
         forgetgate = F.sigmoid(forgetgate)
         cellgate = F.tanh(cellgate)
         outgate = F.sigmoid(outgate)
+
         cy = forgetgate * cx + ingate * cellgate
         hy = outgate * F.tanh(self.c_norm(cy))
-        return hy, cy
 
+        return hy, cy
